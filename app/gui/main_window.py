@@ -1,13 +1,17 @@
+import os
 import tkinter as tk
-from tkinter import Button, Label
+from tkinter import Button, Label, filedialog, messagebox, simpledialog
 
 import cv2
 import numpy as np
-from PIL import Image, ImageTk
+from PIL import ExifTags, Image, ImageTk
 
 from app.detection.yolo_detector import YOLOv8FaceDetector
 from app.recognition.embedder import FaceEmbedder
 from app.tracking.deepsort_tracker import DeepSortFaceTracker
+from app.utils.add_student import add_student
+from database.milvus_handler import MilvusHandler
+from database.mysql_handler import MySQLHandler
 
 
 class FaceAttendanceApp:
@@ -29,11 +33,22 @@ class FaceAttendanceApp:
             window, text="Capture", width=10, command=self.capture_face
         )
         self.btn_snapshot.pack(anchor=tk.CENTER, expand=True)
+        self.btn_add_student = Button(
+            window,
+            text="Tambah Student",
+            width=15,
+            command=self.open_add_student_dialog,
+        )
+        self.btn_add_student.pack(anchor=tk.CENTER, expand=True)
 
         self.embedding_label = Label(
             window, text="Embedding akan muncul di sini", wraplength=600, justify="left"
         )
         self.embedding_label.pack(pady=10)
+
+        self.absent_student_ids = set()
+
+        self.track_id_to_name = {}
 
         self.current_frame = None
         self.current_faces = []
@@ -52,6 +67,144 @@ class FaceAttendanceApp:
         else:
             self.embedding_label.config(text="Tidak ada wajah yang terdeteksi.")
 
+    def open_add_student_dialog(self):
+        # Input nama, NIM, password
+        name = simpledialog.askstring("Nama", "Masukkan nama student:")
+        if not name:
+            return
+        nim = simpledialog.askstring("NIM", "Masukkan NIM student:")
+        if not nim:
+            return
+        password = simpledialog.askstring(
+            "Password Admin", "Masukkan password admin:", show="*"
+        )
+        if not password:
+            return
+        # Pilih file foto
+        photo_path = filedialog.askopenfilename(
+            title="Pilih Foto Wajah", filetypes=[("Image Files", "*.jpg *.jpeg *.png")]
+        )
+        if not photo_path:
+            return
+
+        class_name = simpledialog.askstring("Kelas", "Masukkan nama kelas:")
+        if not class_name:
+            return
+
+        # Simpan foto ke folder (gunakan PIL agar kompatibel)
+        from datetime import datetime
+
+        photo_save_dir = "student_photos"
+        os.makedirs(photo_save_dir, exist_ok=True)
+        save_path = os.path.join(
+            photo_save_dir, f"{nim}_{datetime.now().strftime('%Y%m%d%H%M%S')}.jpg"
+        )
+        img = Image.open(photo_path)
+        try:
+            for orientation in ExifTags.TAGS.keys():
+                if ExifTags.TAGS[orientation] == "Orientation":
+                    break
+            exif = img._getexif()
+            if exif is not None:
+                orientation_value = exif.get(orientation, None)
+                if orientation_value == 3:
+                    img = img.rotate(180, expand=True)
+                elif orientation_value == 6:
+                    img = img.rotate(270, expand=True)
+                elif orientation_value == 8:
+                    img = img.rotate(90, expand=True)
+        except Exception as e:
+            print("EXIF orientation handling error:", e)
+        img.save(save_path)
+
+        # Panggil fungsi add_student
+        ADMIN_PASSWORD = "admin123"  # Ganti sesuai kebutuhan
+        success, msg = add_student(
+            name, nim, img, photo_save_dir, ADMIN_PASSWORD, password, class_name
+        )
+        messagebox.showinfo("Tambah Student", msg)
+
+    def automatic_attendance(self, embedding, threshold=0.6):
+        # 1. Search ke Milvus
+        milvus_handler = MilvusHandler()
+        collection = milvus_handler.collection
+        search_params = {"metric_type": "COSINE", "params": {"nprobe": 10}}
+        results = collection.search(
+            [embedding.tolist()],
+            "embedding",
+            search_params,
+            limit=1,
+            output_fields=["student_id"],
+        )
+        hits = results[0]
+        if not hits or hits[0].distance > threshold:
+            return  # Tidak ada match
+
+        student_id = hits[0].entity.get("student_id")
+        if student_id in self.absent_student_ids:
+            return  # Sudah absen, skip
+
+        self.absent_student_ids.add(student_id)
+        mysql_handler = MySQLHandler()
+        # 2. Ambil data student
+        conn = mysql_handler.get_mysql_connection()
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute(
+            "SELECT s.name, s.nim, s.photo_path, c.name as class_name, s.class_id FROM students s LEFT JOIN classes c ON s.class_id = c.id WHERE s.id=%s",
+            (student_id,),
+        )
+        student = cursor.fetchone()
+        cursor.close()
+        conn.close()
+        if not student:
+            return
+
+        # 3. Insert absensi
+        mysql_handler.insert_attendance(student_id, student["class_id"])
+
+        # 4. Tampilkan pop up
+        from PIL import Image, ImageTk
+
+        img = Image.open(student["photo_path"])
+        img = img.resize((100, 100))
+        imgtk = ImageTk.PhotoImage(img)
+        top = tk.Toplevel(self.window)
+        top.title("Absensi Berhasil")
+        tk.Label(
+            top,
+            text=f"{student['name']} ({student['nim']})\n"
+            f"Telah terabsensi di kelas {student['class_name']}",
+        ).pack()
+        tk.Label(top, image=imgtk).pack()
+        top.imgtk = imgtk  # keep reference
+        top.after(3000, top.destroy)  # pop up hilang otomatis 3 detik
+
+    def get_name_from_embedding(self, embedding, threshold=0.6):
+        milvus_handler = MilvusHandler()
+        collection = milvus_handler.collection
+        search_params = {"metric_type": "COSINE", "params": {"nprobe": 10}}
+        results = collection.search(
+            [embedding.tolist()],
+            "embedding",
+            search_params,
+            limit=1,
+            output_fields=["student_id"],
+        )
+        hits = results[0]
+        if not hits or hits[0].distance > threshold:
+            return None, None
+        student_id = hits[0].entity.get("student_id")
+        mysql_handler = MySQLHandler()
+        conn = mysql_handler.get_mysql_connection()
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT name FROM students WHERE id=%s", (student_id,))
+        student = cursor.fetchone()
+        cursor.close()
+        conn.close()
+        if student:
+            return student["name"], student_id
+        return None, None
+
     def update(self):
         ret, frame = self.vid.read()
         if ret:
@@ -62,8 +215,10 @@ class FaceAttendanceApp:
             h, w = frame.shape[:2]
             embeddings = []
 
+            # Reset mapping setiap frame
+            self.track_id_to_name = {}
+
             for x1, y1, x2, y2, conf in faces:
-                # Unletterbox koordinat ke frame asli
                 x1u = int((x1 - dw) / r)
                 y1u = int((y1 - dh) / r)
                 x2u = int((x2 - dw) / r)
@@ -82,7 +237,6 @@ class FaceAttendanceApp:
 
             self.current_embeddings = embeddings
 
-            # Gunakan bounding box unletterbox untuk tracker
             detections = [
                 [
                     [
@@ -96,15 +250,28 @@ class FaceAttendanceApp:
                 for (x1, y1, x2, y2, conf) in faces
             ]
             tracks = self.tracker.update(detections, embeddings, frame=frame)
-            for track in tracks:
+            for idx, track in enumerate(tracks):
                 if not track.is_confirmed():
                     continue
                 l, t, r_, b = map(int, track.to_ltrb())
                 track_id = track.track_id
+
+                # Cek nama dari embedding
+                if idx < len(embeddings):
+                    name, student_id = self.get_name_from_embedding(embeddings[idx])
+                    if name:
+                        self.track_id_to_name[track_id] = name
+                    else:
+                        self.track_id_to_name[track_id] = "Unknown"
+                else:
+                    self.track_id_to_name[track_id] = "Unknown"
+
+                # Tampilkan ID dan Nama
+                label_text = f"ID: {track_id} | {self.track_id_to_name[track_id]}"
                 cv2.rectangle(frame, (l, t), (r_, b), (0, 255, 0), 2)
                 cv2.putText(
                     frame,
-                    f"ID: {track_id}",
+                    label_text,
                     (l, t - 10),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.7,
@@ -119,11 +286,18 @@ class FaceAttendanceApp:
             self.canvas.create_image(0, 0, anchor=tk.NW, image=imgtk)
             self.canvas.imgtk = imgtk  # keep reference
 
+        if self.current_embeddings:
+            self.automatic_attendance(self.current_embeddings[0])
         self.window.after(self.delay, self.update)
         print("Webcam frame shape:", frame.shape)
 
 
 # Jalankan aplikasi
 if __name__ == "__main__":
+    mysql_handler = MySQLHandler()
+    mysql_handler.create_classes_table()
+    mysql_handler.create_students_table()
+    mysql_handler.create_attendance_table()
+
     root = tk.Tk()
     app = FaceAttendanceApp(root, "Face Attendance System")

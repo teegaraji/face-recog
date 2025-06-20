@@ -7,3 +7,5 @@ filterpy
 lap
 scipy
 deep_sort_realtime
+mysql-connector-python
+pymilvus
