@@ -1,9 +1,11 @@
 import os
+import pickle
 
 import cv2
 
 from app.detection.yolo_detector import YOLOv8FaceDetector
 from app.recognition.embedder import FaceEmbedder
+from app.preprocessing.preprocessor import Preprocessor
 from database.milvus_handler import MilvusHandler
 from database.mysql_handler import MySQLHandler
 
@@ -40,6 +42,7 @@ def add_student(
     # 4. Proses embedding
     detector = YOLOv8FaceDetector()
     embedder = FaceEmbedder()
+    preprocessor = Preprocessor()
     img = cv2.imread(photo_path)
     if img is None:
         return False, "Foto gagal dibaca, pastikan format gambar benar!"
@@ -50,7 +53,10 @@ def add_student(
         return False, "Wajah tidak terdeteksi di foto!"
     x1, y1, x2, y2, _ = faces[0]
     face_crop = img[int(y1) : int(y2), int(x1) : int(x2)]
-    embedding = embedder.get_embedding(face_crop)
+    # Terapkan align_face dan equalize_histogram
+    aligned = preprocessor.align_face(face_crop)
+    equalized = preprocessor.equalize_histogram(aligned)
+    embedding = embedder.get_embedding(equalized)
 
     # 5. Insert ke Milvus
     milvus_handler = MilvusHandler()
@@ -58,5 +64,17 @@ def add_student(
     data = [[student_id], [embedding.tolist()]]
     print(f"Inserted embedding for student_id={student_id} to Milvus")
     collection.insert(data)
+
+    # 6. Simpan ke KNN (pickle)
+    knn_path = os.path.join(photo_save_dir, "knn_embeddings.pkl")
+    if os.path.exists(knn_path):
+        with open(knn_path, "rb") as f:
+            knn_data = pickle.load(f)
+    else:
+        knn_data = {"embeddings": [], "labels": []}
+    knn_data["embeddings"].append(embedding.tolist())
+    knn_data["labels"].append(student_id)
+    with open(knn_path, "wb") as f:
+        pickle.dump(knn_data, f)
 
     return True, "Student berhasil ditambahkan!"

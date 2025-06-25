@@ -1,6 +1,7 @@
 import os
 import tkinter as tk
 from tkinter import Button, Label, filedialog, messagebox, simpledialog
+import pickle
 
 import cv2
 import numpy as np
@@ -12,6 +13,7 @@ from app.tracking.deepsort_tracker import DeepSortFaceTracker
 from app.utils.add_student import add_student
 from database.milvus_handler import MilvusHandler
 from database.mysql_handler import MySQLHandler
+from app.preprocessing.preprocessor import Preprocessor
 
 
 class FaceAttendanceApp:
@@ -25,6 +27,7 @@ class FaceAttendanceApp:
         self.detector = YOLOv8FaceDetector()
         self.embedder = FaceEmbedder()
         self.tracker = DeepSortFaceTracker()
+        self.preprocessor = Preprocessor()
 
         self.canvas = tk.Canvas(window, width=640, height=480)
         self.canvas.pack()
@@ -69,26 +72,24 @@ class FaceAttendanceApp:
 
     def open_add_student_dialog(self):
         # Input nama, NIM, password
+        password = simpledialog.askstring(
+            "Password Admin", "Masukkan password admin:", show="*"
+        )
+        if not password:
+            return
+        class_name = simpledialog.askstring("Kelas", "Masukkan nama kelas:")
+        if not class_name:
+            return
         name = simpledialog.askstring("Nama", "Masukkan nama student:")
         if not name:
             return
         nim = simpledialog.askstring("NIM", "Masukkan NIM student:")
         if not nim:
             return
-        password = simpledialog.askstring(
-            "Password Admin", "Masukkan password admin:", show="*"
-        )
-        if not password:
-            return
-        # Pilih file foto
         photo_path = filedialog.askopenfilename(
             title="Pilih Foto Wajah", filetypes=[("Image Files", "*.jpg *.jpeg *.png")]
         )
         if not photo_path:
-            return
-
-        class_name = simpledialog.askstring("Kelas", "Masukkan nama kelas:")
-        if not class_name:
             return
 
         # Simpan foto ke folder (gunakan PIL agar kompatibel)
@@ -124,7 +125,27 @@ class FaceAttendanceApp:
         )
         messagebox.showinfo("Tambah Student", msg)
 
+    def knn_predict(self, embedding, knn_path="student_photos/knn_embeddings.pkl", threshold=0.6):
+        if not os.path.exists(knn_path):
+            return None, None
+        with open(knn_path, "rb") as f:
+            knn_data = pickle.load(f)
+        embeddings = np.array(knn_data["embeddings"])
+        labels = np.array(knn_data["labels"])
+        if len(embeddings) == 0:
+            return None, None
+        # KNN: cosine similarity
+        normed = embedding / (np.linalg.norm(embedding) + 1e-8)
+        normed_db = embeddings / (np.linalg.norm(embeddings, axis=1, keepdims=True) + 1e-8)
+        sims = np.dot(normed_db, normed)
+        idx = np.argmax(sims)
+        if sims[idx] > threshold:
+            return labels[idx], sims[idx]
+        return None, None
+
     def automatic_attendance(self, embedding, threshold=0.6):
+        # Terapkan align_face & equalize_histogram sebelum attendance
+        # (embedding sudah hasil preprocess di update())
         # 1. Search ke Milvus
         milvus_handler = MilvusHandler()
         collection = milvus_handler.collection
@@ -137,12 +158,14 @@ class FaceAttendanceApp:
             output_fields=["student_id"],
         )
         hits = results[0]
-        if not hits or hits[0].distance > threshold:
-            return  # Tidak ada match
-
-        student_id = hits[0].entity.get("student_id")
-        if student_id in self.absent_student_ids:
-            return  # Sudah absen, skip
+        student_id = None
+        if hits and hits[0].distance <= threshold:
+            student_id = hits[0].entity.get("student_id")
+        else:
+            # Coba KNN jika Milvus tidak match
+            student_id, sim = self.knn_predict(embedding)
+        if not student_id or student_id in self.absent_student_ids:
+            return  # Tidak ada match atau sudah absen
 
         self.absent_student_ids.add(student_id)
         mysql_handler = MySQLHandler()
@@ -191,9 +214,13 @@ class FaceAttendanceApp:
             output_fields=["student_id"],
         )
         hits = results[0]
-        if not hits or hits[0].distance > threshold:
+        student_id = None
+        if hits and hits[0].distance <= threshold:
+            student_id = hits[0].entity.get("student_id")
+        else:
+            student_id, sim = self.knn_predict(embedding)
+        if not student_id:
             return None, None
-        student_id = hits[0].entity.get("student_id")
         mysql_handler = MySQLHandler()
         conn = mysql_handler.get_mysql_connection()
         cursor = conn.cursor(dictionary=True)
@@ -232,7 +259,10 @@ class FaceAttendanceApp:
                 if face_crop.size == 0:
                     embeddings.append(np.zeros((128,)))
                     continue
-                embedding = self.embedder.get_embedding(face_crop)
+                # Terapkan align_face & equalize_histogram sebelum embedding
+                aligned = self.preprocessor.align_face(face_crop)
+                equalized = self.preprocessor.equalize_histogram(aligned)
+                embedding = self.embedder.get_embedding(equalized)
                 embeddings.append(embedding)
 
             self.current_embeddings = embeddings

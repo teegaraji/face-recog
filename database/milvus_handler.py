@@ -33,7 +33,6 @@ class MilvusHandler:
             print(f"Collection '{self.collection_name}' created.")
         else:
             collection = Collection(name=self.collection_name)
-            print(f"Collection '{self.collection_name}' already exists.")
 
         # Index
         index_params = {

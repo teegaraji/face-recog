@@ -36,6 +36,64 @@ class Preprocessor:
 
         return padded, r, dw, dh
 
+    def align_face(self, image):
+        """Align face using landmarks (not implemented, passthrough for now)."""
+        return image
+
+    def equalize_histogram(self, image):
+        img_yuv = cv2.cvtColor(image, cv2.COLOR_BGR2YUV)
+        img_yuv[:, :, 0] = cv2.equalizeHist(img_yuv[:, :, 0])
+        img_output = cv2.cvtColor(img_yuv, cv2.COLOR_YUV2BGR)
+        return img_output
+
+    def preprocess_for_detection(self, image, input_size):
+        img = self.to_rgb(image)
+        img, r, dw, dh = self.letterbox(img, input_size)
+        img = self.normalize(img)
+        img = np.transpose(img, (2, 0, 1))
+        img = np.expand_dims(img, axis=0)
+        return img, r, dw, dh
+
+    def preprocess_for_embedding(self, face_img, input_size):
+        """Preprocess cropped face for embedding model."""
+        img = self.resize(face_img, input_size)
+        img = self.normalize(img)
+        img = np.expand_dims(img, axis=0)
+        return img
+        shape = self.predictor(img_rgb, dets[0])
+        # Ambil koordinat mata kiri dan kanan dari landmark
+        left_eye = (shape.part(36).x, shape.part(36).y)
+        right_eye = (shape.part(45).x, shape.part(45).y)
+
+        # Hitung sudut rotasi
+        dx = right_eye[0] - left_eye[0]
+        dy = right_eye[1] - left_eye[1]
+        angle = np.degrees(np.arctan2(dy, dx))
+
+        # Tentukan pusat antara kedua mata
+        eyes_center = (
+            (left_eye[0] + right_eye[0]) // 2,
+            (left_eye[1] + right_eye[1]) // 2,
+        )
+
+        # Buat matriks rotasi
+        M = cv2.getRotationMatrix2D(eyes_center, angle, scale=1.0)
+        aligned = cv2.warpAffine(
+            img_rgb, M, (img_rgb.shape[1], img_rgb.shape[0]), flags=cv2.INTER_CUBIC
+        )
+        if aligned.dtype != np.uint8:
+            aligned = aligned.astype(np.uint8)
+        if len(aligned.shape) == 2:
+            aligned = cv2.cvtColor(aligned, cv2.COLOR_GRAY2RGB)
+        print("align_face output dtype:", aligned.dtype, "shape:", aligned.shape)
+        return aligned
+
+    def equalize_histogram(self, image):
+        img_yuv = cv2.cvtColor(image, cv2.COLOR_BGR2YUV)
+        img_yuv[:, :, 0] = cv2.equalizeHist(img_yuv[:, :, 0])
+        img_output = cv2.cvtColor(img_yuv, cv2.COLOR_YUV2BGR)
+        return img_output
+
     def preprocess_for_detection(self, image, input_size):
         img = self.to_rgb(image)
         img, r, dw, dh = self.letterbox(img, input_size)
