@@ -37,7 +37,7 @@ class Preprocessor:
         return padded, r, dw, dh
 
     def align_face(self, image):
-        """Align face using landmarks (not implemented, passthrough for now)."""
+        """Passthrough: tidak ada alignment berbasis landmark."""
         return image
 
     def equalize_histogram(self, image):

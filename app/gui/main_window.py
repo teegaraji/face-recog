@@ -1,19 +1,20 @@
 import os
+import pickle
 import tkinter as tk
 from tkinter import Button, Label, filedialog, messagebox, simpledialog
-import pickle
 
 import cv2
 import numpy as np
 from PIL import ExifTags, Image, ImageTk
 
 from app.detection.yolo_detector import YOLOv8FaceDetector
+from app.preprocessing.preprocessor import Preprocessor
 from app.recognition.embedder import FaceEmbedder
 from app.tracking.deepsort_tracker import DeepSortFaceTracker
 from app.utils.add_student import add_student
-from database.milvus_handler import MilvusHandler
+
+from database.milvus_handler import MilvusHandler  # aktifkan kembali import ini
 from database.mysql_handler import MySQLHandler
-from app.preprocessing.preprocessor import Preprocessor
 
 
 class FaceAttendanceApp:
@@ -77,7 +78,7 @@ class FaceAttendanceApp:
         )
         if not password:
             return
-        class_name = simpledialog.askstring("Kelas", "Masukkan nama kelas:")
+        class_name = simpledialog.askstring("Kelas", "Masukkan kode kelas:")
         if not class_name:
             return
         name = simpledialog.askstring("Nama", "Masukkan nama student:")
@@ -86,10 +87,13 @@ class FaceAttendanceApp:
         nim = simpledialog.askstring("NIM", "Masukkan NIM student:")
         if not nim:
             return
-        photo_path = filedialog.askopenfilename(
-            title="Pilih Foto Wajah", filetypes=[("Image Files", "*.jpg *.jpeg *.png")]
+        # Pilih 7 foto
+        photo_paths = filedialog.askopenfilenames(
+            title="Pilih 7 Foto Wajah",
+            filetypes=[("Image Files", "*.jpg *.jpeg *.png")],
         )
-        if not photo_path:
+        if not photo_paths or len(photo_paths) != 7:
+            messagebox.showerror("Error", "Pilih tepat 7 foto wajah!")
             return
 
         # Simpan foto ke folder (gunakan PIL agar kompatibel)
@@ -97,55 +101,70 @@ class FaceAttendanceApp:
 
         photo_save_dir = "student_photos"
         os.makedirs(photo_save_dir, exist_ok=True)
-        save_path = os.path.join(
-            photo_save_dir, f"{nim}_{datetime.now().strftime('%Y%m%d%H%M%S')}.jpg"
-        )
-        img = Image.open(photo_path)
-        try:
-            for orientation in ExifTags.TAGS.keys():
-                if ExifTags.TAGS[orientation] == "Orientation":
-                    break
-            exif = img._getexif()
-            if exif is not None:
-                orientation_value = exif.get(orientation, None)
-                if orientation_value == 3:
-                    img = img.rotate(180, expand=True)
-                elif orientation_value == 6:
-                    img = img.rotate(270, expand=True)
-                elif orientation_value == 8:
-                    img = img.rotate(90, expand=True)
-        except Exception as e:
-            print("EXIF orientation handling error:", e)
-        img.save(save_path)
+        saved_paths = []
+        for idx, photo_path in enumerate(photo_paths):
+            img = Image.open(photo_path)
+            try:
+                for orientation in ExifTags.TAGS.keys():
+                    if ExifTags.TAGS[orientation] == "Orientation":
+                        break
+                exif = img._getexif()
+                if exif is not None:
+                    orientation_value = exif.get(orientation, None)
+                    if orientation_value == 3:
+                        img = img.rotate(180, expand=True)
+                    elif orientation_value == 6:
+                        img = img.rotate(270, expand=True)
+                    elif orientation_value == 8:
+                        img = img.rotate(90, expand=True)
+            except Exception as e:
+                print("EXIF orientation handling error:", e)
+            save_path = os.path.join(
+                photo_save_dir,
+                f"{nim}_{idx+1}_{datetime.now().strftime('%Y%m%d%H%M%S')}.jpg",
+            )
+            img.save(save_path)
+            saved_paths.append(save_path)
 
         # Panggil fungsi add_student
         ADMIN_PASSWORD = "admin123"  # Ganti sesuai kebutuhan
         success, msg = add_student(
-            name, nim, img, photo_save_dir, ADMIN_PASSWORD, password, class_name
+            name, nim, saved_paths, photo_save_dir, ADMIN_PASSWORD, password, class_name
         )
         messagebox.showinfo("Tambah Student", msg)
 
-    def knn_predict(self, embedding, knn_path="student_photos/knn_embeddings.pkl", threshold=0.6):
+    def knn_predict(
+        self, embedding, knn_path="student_photos/knn_model.pkl", threshold=0.7
+    ):
         if not os.path.exists(knn_path):
             return None, None
-        with open(knn_path, "rb") as f:
-            knn_data = pickle.load(f)
+        try:
+            with open(knn_path, "rb") as f:
+                knn_data = pickle.load(f)
+        except ModuleNotFoundError as e:
+            print(
+                "KNN model file is not compatible (possibly contains sklearn object). Please delete and regenerate knn_model.pkl."
+            )
+            return None, None
+        except Exception as e:
+            print("Error loading knn_model.pkl:", e)
+            return None, None
         embeddings = np.array(knn_data["embeddings"])
         labels = np.array(knn_data["labels"])
         if len(embeddings) == 0:
             return None, None
         # KNN: cosine similarity
         normed = embedding / (np.linalg.norm(embedding) + 1e-8)
-        normed_db = embeddings / (np.linalg.norm(embeddings, axis=1, keepdims=True) + 1e-8)
+        normed_db = embeddings / (
+            np.linalg.norm(embeddings, axis=1, keepdims=True) + 1e-8
+        )
         sims = np.dot(normed_db, normed)
         idx = np.argmax(sims)
         if sims[idx] > threshold:
             return labels[idx], sims[idx]
         return None, None
 
-    def automatic_attendance(self, embedding, threshold=0.6):
-        # Terapkan align_face & equalize_histogram sebelum attendance
-        # (embedding sudah hasil preprocess di update())
+    def automatic_attendance(self, embedding, threshold=0.7):
         # 1. Search ke Milvus
         milvus_handler = MilvusHandler()
         collection = milvus_handler.collection
@@ -202,7 +221,7 @@ class FaceAttendanceApp:
         top.imgtk = imgtk  # keep reference
         top.after(3000, top.destroy)  # pop up hilang otomatis 3 detik
 
-    def get_name_from_embedding(self, embedding, threshold=0.6):
+    def get_name_from_embedding(self, embedding, threshold=0.7):
         milvus_handler = MilvusHandler()
         collection = milvus_handler.collection
         search_params = {"metric_type": "COSINE", "params": {"nprobe": 10}}
@@ -259,7 +278,7 @@ class FaceAttendanceApp:
                 if face_crop.size == 0:
                     embeddings.append(np.zeros((128,)))
                     continue
-                # Terapkan align_face & equalize_histogram sebelum embedding
+                # Konsisten: align_face dan equalize_histogram
                 aligned = self.preprocessor.align_face(face_crop)
                 equalized = self.preprocessor.equalize_histogram(aligned)
                 embedding = self.embedder.get_embedding(equalized)
